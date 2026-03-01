@@ -315,7 +315,7 @@ Multi-crop (center / left / right shift ±200ms) に対応。
 
 ```powershell
 $py = ".\venv\Scripts\python.exe"
-$trainArgs = 'metric_learning/train.py --data_dir ./metric_learning/data --output_dir ./metric_learning/checkpoints --epochs 50 --batch_size 24 --lr 3e-4 --warmup_epochs 3 --margin_schedule "0,0.05,0.1,0.15,0.2,0.25,0.3,0.35" --scale_schedule "20,32,40,48" --schedule_epochs 10 --hard_negative --hn_start_epoch 13 --hn_warmup_epochs 5 --log_file ./metric_learning/checkpoints/train_log.txt --gradient_checkpointing'
+$trainArgs = 'metric_learning/train.py --data_dir ./metric_learning/data --output_dir ./metric_learning/checkpoints --epochs 50 --batch_size 24 --lr 3e-4 --warmup_epochs 3 --margin_schedule "0,0.05,0.1,0.15,0.2,0.25,0.3,0.35" --scale_schedule "20,32,40,48" --schedule_epochs 24 --max_samples_per_class 100 --balance_classes --balance_samples_per_class 20 --log_file ./metric_learning/checkpoints/train_log.txt --gradient_checkpointing'
 Start-Process -NoNewWindow -FilePath $py -ArgumentList $trainArgs -WorkingDirectory (Get-Location) -RedirectStandardOutput ./metric_learning/checkpoints/stdout.txt -RedirectStandardError ./metric_learning/checkpoints/stderr.txt
 ```
 

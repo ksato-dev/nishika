@@ -80,6 +80,8 @@ def parse_args():
     p.add_argument("--log_file", type=str, default=None)
     p.add_argument("--init_weights", type=str, default=None,
                    help="初期重みチェックポイント (転移学習用)")
+    p.add_argument("--resume", type=str, default=None,
+                   help="チェックポイントから学習を再開 (model + optimizer + scheduler + epoch)")
 
     # Augmentation
     p.add_argument("--no_augment", action="store_true")
@@ -537,13 +539,36 @@ def train():
 
     best_val_acc = 0.0
     history = {"train_loss": [], "val_loss": [], "val_acc": []}
+    start_epoch = 1
+
+    # --- Resume from checkpoint ---
+    if args.resume is not None:
+        if not os.path.isfile(args.resume):
+            logger.error("Resume checkpoint not found: %s", args.resume)
+            sys.exit(1)
+        logger.info("Resuming from: %s", args.resume)
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        if "epoch" in ckpt:
+            start_epoch = ckpt["epoch"] + 1
+        if "val_acc" in ckpt and ckpt["val_acc"] is not None:
+            best_val_acc = ckpt["val_acc"]
+        history_path = os.path.join(args.output_dir, "history.json")
+        if os.path.isfile(history_path):
+            with open(history_path, "r") as f:
+                history = json.load(f)
+        logger.info("  Resumed: epoch=%d, best_val_acc=%.4f", start_epoch, best_val_acc)
 
     use_file_log = args.log_file is not None
     disable_tqdm = use_file_log
     total_steps = len(train_loader)
 
-    logger.info("Training: %d epochs, %d steps/epoch, batch=%d, lr=%s",
-                args.epochs, total_steps, args.batch_size, args.lr)
+    logger.info("Training: epochs %d-%d, %d steps/epoch, batch=%d, lr=%s",
+                start_epoch, args.epochs, total_steps, args.batch_size, args.lr)
     logger.info("  ArcFace scale=%.1f, target_margin=%.2f", args.arcface_scale, args.arcface_margin)
     if margin_schedule:
         logger.info("  Margin schedule (%d ep): %s", args.schedule_epochs, margin_schedule)
@@ -552,7 +577,7 @@ def train():
     logger.info("=" * 80)
 
     global_step = 0
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_loss = 0.0
         epoch_correct = 0

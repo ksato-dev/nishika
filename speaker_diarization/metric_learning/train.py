@@ -256,6 +256,9 @@ def evaluate_embeddings(model, val_loader, id2label, device, use_amp=False):
                 emb = raw_model.extract_embedding(input_values, attention_mask=attention_mask)
             all_embeddings.append(emb.float().cpu())
             all_labels.append(batch["labels"])
+            del input_values, attention_mask, emb
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     all_embeddings = torch.cat(all_embeddings, dim=0)  # (N, D)
     all_labels = torch.cat(all_labels, dim=0)           # (N,)
@@ -623,7 +626,8 @@ def train():
             is_accum_step = (step % accum_steps == 0) or (step == total_steps)
             if is_accum_step:
                 scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                _gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_norm = _gn.item() if torch.is_tensor(_gn) else float(_gn)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
@@ -638,7 +642,7 @@ def train():
                 acc = epoch_correct / epoch_total
 
                 with torch.no_grad():
-                    logits = outputs["logits"].float()
+                    logits = outputs["logits"].detach().float()
                     logit_mean = logits.mean().item()
                     logit_std = logits.std().item()
                     logit_max = logits.max().item()
@@ -651,8 +655,7 @@ def train():
                     margin_gap = (correct_logits - max_wrong_logits).mean().item()
                     top5_preds = logits.topk(min(5, logits.size(1)), dim=1).indices
                     top5_correct = (top5_preds == labels.unsqueeze(1)).any(dim=1).float().mean().item()
-                    emb = outputs["embeddings"].float()
-                    # SubCenter: (C*K, D) → (C, K, D), 各クラスの最近サブセンターとの cos
+                    emb = outputs["embeddings"].detach().float()
                     _W = F.normalize(model.arcface.weight.data, p=2, dim=1)
                     _K = model.arcface.num_subcenters
                     _C = model.arcface.num_classes
@@ -660,8 +663,9 @@ def train():
                     _sub = _W[labels]  # (B, K, D)
                     _cos_all = (emb.unsqueeze(1) * _sub).sum(dim=2)  # (B, K)
                     cos_correct = _cos_all.max(dim=1).values.mean().item()
+                    del logits, emb, _W, _sub, _cos_all
 
-                gn = grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm
+                gn = grad_norm
                 if disable_tqdm:
                     logger.info(
                         "  [E%d] %d/%d | loss=%.4f acc=%.4f top5=%.4f | "
@@ -675,8 +679,14 @@ def train():
                     pbar.set_postfix(loss=f"{avg:.4f}", acc=f"{acc:.4f}",
                                      gap=f"{margin_gap:.2f}", cos=f"{cos_correct:.4f}")
 
+            del outputs, loss, input_values, labels, attention_mask
+
             if args.max_steps and global_step >= args.max_steps:
                 break
+
+        del pbar
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         scheduler.step()
         elapsed = time.time() - start_time

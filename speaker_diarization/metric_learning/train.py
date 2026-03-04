@@ -151,6 +151,14 @@ def parse_args():
     p.add_argument("--no_split_by_record", dest="split_by_record", action="store_false",
                    help="従来のサンプル単位 shuffle split に戻す")
 
+    # Cross-validation & early stopping
+    p.add_argument("--fold", type=int, default=None, help="CV fold index (0-based)")
+    p.add_argument("--n_folds", type=int, default=5, help="CV fold 数")
+    p.add_argument("--train_all", action="store_true",
+                   help="全データで学習 (validation なし)")
+    p.add_argument("--early_stopping_patience", type=int, default=0,
+                   help="Early stopping patience (0=無効)")
+
     return p.parse_args()
 
 
@@ -325,21 +333,19 @@ def evaluate_embeddings(model, val_loader, id2label, device, use_amp=False):
             correct_total += rec_correct
             sample_total += rec_total
 
-        # Intra-class similarity (within this record)
+        # Intra: 各サンプル → 自クラス重心 の cosine similarity
+        # Inter: 各サンプル → 最も近い他クラス重心 の cosine similarity
         for s in speaker_labs:
             idxs = valid_speakers[s]
-            if len(idxs) < 2:
-                continue
-            embs = all_embeddings[idxs]
-            sims = F.cosine_similarity(embs.unsqueeze(0), embs.unsqueeze(1), dim=2)
-            mask = ~torch.eye(len(idxs), dtype=torch.bool)
-            intra_sims_all.append(sims[mask].mean().item())
-
-        # Inter-class similarity (between speakers in this record)
-        for i_a, s_a in enumerate(speaker_labs):
-            for s_b in speaker_labs[i_a + 1:]:
-                sim = F.cosine_similarity(centroids[lab_to_local[s_a]], centroids[lab_to_local[s_b]]).item()
-                inter_sims_all.append(sim)
+            local_idx = lab_to_local[s]
+            embs = all_embeddings[idxs]  # (K, D)
+            sim_to_all = F.cosine_similarity(
+                embs.unsqueeze(1), centroid_mat.unsqueeze(0), dim=2
+            )  # (K, S)
+            intra_sims_all.extend(sim_to_all[:, local_idx].tolist())
+            other_mask = torch.ones(len(speaker_labs), dtype=torch.bool)
+            other_mask[local_idx] = False
+            inter_sims_all.extend(sim_to_all[:, other_mask].max(dim=1).values.tolist())
 
     record_acc = correct_total / max(sample_total, 1)
     intra_sim = float(np.mean(intra_sims_all)) if intra_sims_all else 0.0
@@ -355,8 +361,11 @@ def evaluate_embeddings(model, val_loader, id2label, device, use_amp=False):
     }
 
 
-def train():
-    args = parse_args()
+def train(override_args=None):
+    if override_args is not None:
+        args = override_args
+    else:
+        args = parse_args()
     setup_logging(args.log_file)
     set_seed(args.seed)
 
@@ -415,18 +424,25 @@ def train():
     else:
         logger.info("Augmentation: OFF")
 
+    ds_common = dict(
+        data_dir=args.data_dir, label2id=label2id, seed=args.seed,
+        split_by_record=args.split_by_record,
+        fold=args.fold, n_folds=args.n_folds,
+        train_all=args.train_all,
+    )
     train_dataset = SpeakerClipDataset(
-        data_dir=args.data_dir, split="train",
-        validation_ratio=args.val_ratio, label2id=label2id, seed=args.seed,
-        augmentor=augmentor,
+        split="train", augmentor=augmentor,
+        validation_ratio=args.val_ratio,
         max_samples_per_class=args.max_samples_per_class,
-        split_by_record=args.split_by_record,
+        **ds_common,
     )
-    val_dataset = SpeakerClipDataset(
-        data_dir=args.data_dir, split="val",
-        validation_ratio=args.val_ratio, label2id=label2id, seed=args.seed,
-        split_by_record=args.split_by_record,
-    )
+    skip_val = args.train_all
+    val_dataset = None
+    if not skip_val:
+        val_dataset = SpeakerClipDataset(
+            split="val", validation_ratio=args.val_ratio,
+            **ds_common,
+        )
 
     if train_dataset._flat_audio is not None and args.num_workers > 0:
         args.num_workers = 0
@@ -469,10 +485,12 @@ def train():
             pin_memory=True, drop_last=True,
         )
 
-    val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
-    )
+    val_loader = None
+    if not skip_val:
+        val_loader = DataLoader(
+            val_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
+        )
 
     model = SpeakerMetricLearner(
         num_classes=num_classes,
@@ -538,6 +556,8 @@ def train():
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     best_val_acc = 0.0
+    best_epoch = 0
+    patience_counter = 0
     history = {"train_loss": [], "val_loss": [], "val_acc": []}
     start_epoch = 1
 
@@ -718,11 +738,15 @@ def train():
         train_loss = epoch_loss / max(epoch_total, 1)
         train_acc = epoch_correct / max(epoch_total, 1)
 
-        do_val = (epoch % args.val_interval == 0) or (args.max_steps and global_step >= args.max_steps)
-        val_metric = None  # best model 判定に使う指標
+        do_val = (not skip_val) and (
+            (epoch % args.val_interval == 0) or (args.max_steps and global_step >= args.max_steps)
+        )
+        val_metric = None
+        val_acc = None
+        val_loss = None
         if do_val:
             history["train_loss"].append(train_loss)
-            if args.split_by_record:
+            if args.split_by_record or args.fold is not None:
                 val_id2label = val_dataset.id2label
                 emb_metrics = evaluate_embeddings(
                     model, val_loader, val_id2label, device, use_amp=use_amp,
@@ -758,8 +782,9 @@ def train():
                             epoch, args.epochs, elapsed, train_loss, train_acc, val_loss, val_acc)
         else:
             history["train_loss"].append(train_loss)
-            logger.info("Epoch %d/%d (%.1fs) | Train: loss=%.4f acc=%.4f | (val skipped)",
-                        epoch, args.epochs, elapsed, train_loss, train_acc)
+            logger.info("Epoch %d/%d (%.1fs) | Train: loss=%.4f acc=%.4f%s",
+                        epoch, args.epochs, elapsed, train_loss, train_acc,
+                        " | (train_all)" if skip_val else " | (val skipped)")
 
         # --- チェックポイント保存 ---
         _ckpt_payload = {
@@ -767,8 +792,8 @@ def train():
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
-            "val_acc": val_acc if do_val else None,
-            "val_loss": val_loss if do_val else None,
+            "val_acc": val_acc,
+            "val_loss": val_loss,
             "train_loss": train_loss,
             "num_classes": num_classes,
             "embedding_dim": args.embedding_dim,
@@ -778,9 +803,13 @@ def train():
 
         if do_val and val_metric is not None and val_metric > best_val_acc:
             best_val_acc = val_metric
+            best_epoch = epoch
+            patience_counter = 0
             best_path = os.path.join(args.output_dir, "best_model.pt")
             torch.save(_ckpt_payload, best_path)
             logger.info("  -> Best model saved (val_acc=%.4f)", val_metric)
+        elif do_val:
+            patience_counter += 1
 
         # 定期チェックポイント (N エポックごと)
         if args.save_interval > 0 and epoch % args.save_interval == 0:
@@ -792,7 +821,7 @@ def train():
         latest_path = os.path.join(args.output_dir, "latest_model.pt")
         torch.save(_ckpt_payload, latest_path)
 
-        # history.json も毎エポック更新 (途中クラッシュでもログが残る)
+        # history.json も毎エポック更新
         with open(os.path.join(args.output_dir, "history.json"), "w") as f:
             json.dump(history, f, indent=2)
 
@@ -803,9 +832,15 @@ def train():
             logger.info("Reached max_steps=%d; stopping.", args.max_steps)
             break
 
+        # --- Early stopping ---
+        if args.early_stopping_patience > 0 and patience_counter >= args.early_stopping_patience:
+            logger.info("Early stopping at epoch %d (patience=%d, best_epoch=%d, best_val_acc=%.4f)",
+                        epoch, args.early_stopping_patience, best_epoch, best_val_acc)
+            break
+
     final_path = os.path.join(args.output_dir, "final_model.pt")
     torch.save({
-        "epoch": args.epochs,
+        "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "num_classes": num_classes,
         "embedding_dim": args.embedding_dim,
@@ -817,8 +852,10 @@ def train():
         json.dump(history, f, indent=2)
 
     logger.info("=" * 80)
-    logger.info("Training complete! Best val acc: %.4f", best_val_acc)
+    logger.info("Training complete! Best epoch: %d, Best val acc: %.4f", best_epoch, best_val_acc)
     logger.info("Saved to: %s", args.output_dir)
+
+    return {"best_epoch": best_epoch, "best_val_acc": best_val_acc}
 
 
 if __name__ == "__main__":

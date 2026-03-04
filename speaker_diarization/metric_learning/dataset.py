@@ -352,6 +352,9 @@ class SpeakerClipDataset(Dataset):
         preload: bool = True,
         max_samples_per_class: Optional[int] = None,
         split_by_record: bool = True,
+        fold: Optional[int] = None,
+        n_folds: int = 5,
+        train_all: bool = False,
     ):
         self.data_dir = Path(data_dir)
         self.max_length = max_length
@@ -380,8 +383,43 @@ class SpeakerClipDataset(Dataset):
 
         rng = random.Random(seed)
 
-        if split_by_record:
-            # --- レコード (audio_id) 単位で split ---
+        if train_all:
+            # --- 全データを学習に使用 (validation なし) ---
+            selected = list(range(len(all_files)))
+            print(f"[{split}] train_all: {len(selected)} samples (no split)")
+
+        elif fold is not None and split_by_record:
+            # --- K-fold CV (レコード単位) ---
+            record_ids = sorted(set(
+                _extract_record_id(cn) for cn in self.label2id.keys()
+            ))
+            rng.shuffle(record_ids)
+            fold_size = len(record_ids) // n_folds
+            remainder = len(record_ids) % n_folds
+            folds = []
+            start = 0
+            for f in range(n_folds):
+                end = start + fold_size + (1 if f < remainder else 0)
+                folds.append(record_ids[start:end])
+                start = end
+
+            if split == "val":
+                split_records = set(folds[fold])
+            else:
+                split_records = set()
+                for f in range(n_folds):
+                    if f != fold:
+                        split_records.update(folds[f])
+
+            selected = [
+                i for i, cn in enumerate(all_class_names)
+                if _extract_record_id(cn) in split_records
+            ]
+            print(f"[{split}] Fold {fold}/{n_folds}: "
+                  f"{len(split_records)} records, {len(selected)} samples")
+
+        elif split_by_record:
+            # --- レコード単位で split (従来の 80/20) ---
             record_ids = sorted(set(
                 _extract_record_id(cn) for cn in self.label2id.keys()
             ))

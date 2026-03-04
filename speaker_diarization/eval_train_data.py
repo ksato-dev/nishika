@@ -4,8 +4,17 @@
   1. voiceprint を全ファイル分まとめて事前ロード
   2. 音声読込+VAD (CPU) と embedding (GPU) をパイプラインで重畳
   3. DER 計算を ThreadPoolExecutor で並列化
+
+使い方:
+  python eval_train_data.py                                          # pyannote/embedding
+  python eval_train_data.py --checkpoint metric_learning/checkpoints/best_model.pt  # 学習済みモデル
+
+  マシンリソース軽め:
+  python eval_train_data.py --checkpoint ... --device cpu --embed_batch_size 8
+  (--device cpu: GPU を使わず CPU のみ, --embed_batch_size: 小さいほどメモリ節約・遅くなる)
 """
 
+import argparse
 import glob
 import logging
 import os
@@ -107,13 +116,25 @@ def evaluate(
 
 
 def main() -> None:
-    train_audio_files = get_audio_files()
+    parser = argparse.ArgumentParser(description="話者ダイアリゼーション評価")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="metric learning のチェックポイント (.pt)")
+    parser.add_argument("--data_dir", type=str, default="./input")
+    parser.add_argument("--device", type=str, default=None,
+                        help="推論デバイス (例: cuda, cpu)。未指定なら cuda があれば cuda")
+    parser.add_argument("--embed_batch_size", type=int, default=None,
+                        help="embedding のバッチサイズ。小さいほどメモリ節約 (例: 8, 16)")
+    args = parser.parse_args()
+
+    train_audio_files = get_audio_files(data_dir=args.data_dir)
     print(f"train データ: {len(train_audio_files)} ファイル")
 
-    diarizer = SpeakerDiarizer()
-    df_label = pl.read_csv(os.path.join("./input", "train_annotation.csv"))
+    diarizer_kw: dict = {"embedding_checkpoint": args.checkpoint, "device": args.device}
+    if args.embed_batch_size is not None:
+        diarizer_kw["embed_batch_size"] = args.embed_batch_size
+    diarizer = SpeakerDiarizer(**diarizer_kw)
+    df_label = pl.read_csv(os.path.join(args.data_dir, "train_annotation.csv"))
 
-    # voiceprint を全ディレクトリ分まとめて事前ロード
     audio_dirs = list({str(Path(f).parent) for f in train_audio_files})
     diarizer.preload_all_voiceprints(audio_dirs)
 

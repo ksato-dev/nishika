@@ -74,16 +74,29 @@ class SpeakerDiarizer:
     """話者ダイアリゼーション用モデルをまとめて管理するクラス。
 
     モデルを一度だけロードし、複数の音声ファイルに対して再利用できる。
+
+    embedding_checkpoint: metric learning のチェックポイント (.pt) を指定すると
+    pyannote/embedding の代わりに学習済みモデルで embedding を計算する。
     """
 
-    def __init__(self, hf_token: str | None = None, embed_batch_size: int = _EMB_BATCH_SIZE):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def __init__(
+        self,
+        hf_token: str | None = None,
+        embed_batch_size: int = _EMB_BATCH_SIZE,
+        embedding_checkpoint: str | None = None,
+        device: str | None = None,
+    ):
+        if device is not None:
+            self.device = torch.device(device)
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._voiceprints_cache: dict[str, dict[str, np.ndarray]] = {}
         self._vp_matrix_cache: dict[str, tuple[list[str], np.ndarray]] = {}
         self.embed_batch_size = embed_batch_size
-        self._load_models(hf_token or os.getenv("HF_ACCESS_TOKEN"))
+        self._use_custom_model = embedding_checkpoint is not None
+        self._load_models(hf_token or os.getenv("HF_ACCESS_TOKEN"), embedding_checkpoint)
 
-    def _load_models(self, hf_token: str | None) -> None:
+    def _load_models(self, hf_token: str | None, embedding_checkpoint: str | None = None) -> None:
         logger.info("モデルをロード中...")
 
         use_onnx = _HAS_ONNXRUNTIME
@@ -93,12 +106,37 @@ class SpeakerDiarizer:
         else:
             logger.info("Silero VAD: JIT バックエンド (onnxruntime をインストールすると ~3 倍高速化)")
 
-        pyannote_emb = Model.from_pretrained(
-            "pyannote/embedding", use_auth_token=hf_token
-        )
-        pyannote_emb.to(self.device)
-        self.inference = Inference(pyannote_emb, window="whole")
+        if embedding_checkpoint is not None:
+            self._load_custom_embedding_model(embedding_checkpoint)
+        else:
+            pyannote_emb = Model.from_pretrained(
+                "pyannote/embedding", use_auth_token=hf_token
+            )
+            pyannote_emb.to(self.device)
+            self.inference = Inference(pyannote_emb, window="whole")
         logger.info("モデルロード完了")
+
+    def _load_custom_embedding_model(self, checkpoint_path: str) -> None:
+        """metric learning のチェックポイントから embedding モデルをロードする。"""
+        import sys
+        ml_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metric_learning")
+        if ml_dir not in sys.path:
+            sys.path.insert(0, ml_dir)
+        from model import SpeakerMetricLearner
+
+        ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        ckpt_args = ckpt.get("args", {})
+        self._custom_model = SpeakerMetricLearner(
+            num_classes=ckpt.get("num_classes", ckpt_args.get("num_classes", 415)),
+            embedding_dim=ckpt.get("embedding_dim", ckpt_args.get("embedding_dim", 192)),
+            pretrained_model=ckpt.get("pretrained_model", ckpt_args.get("pretrained_model", "microsoft/wavlm-base-plus")),
+            num_subcenters=ckpt_args.get("num_subcenters", 3),
+        )
+        self._custom_model.load_state_dict(ckpt["model_state_dict"])
+        self._custom_model.to(self.device)
+        self._custom_model.eval()
+        logger.info("Custom embedding model loaded: %s (dim=%d)",
+                     checkpoint_path, self._custom_model.embedding_dim)
 
     def _detect_speech_from_tensor(self, audio_tensor: torch.Tensor) -> list[dict]:
         """メモリ上の音声テンソルから Silero VAD で発話区間を検出する。"""
@@ -108,6 +146,14 @@ class SpeakerDiarizer:
 
     def _inference_normalized(self, wav_path: str) -> np.ndarray:
         """音声ファイルを正規化してから embedding を計算する。"""
+        if self._use_custom_model:
+            waveform = read_audio(wav_path)
+            if AUDIO_POWER_NORMALIZE:
+                waveform = _power_normalize(waveform)
+            waveform = waveform.unsqueeze(0).to(self.device)
+            with torch.inference_mode(), torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
+                emb = self._custom_model.extract_embedding(waveform)
+            return emb.float().cpu().numpy().squeeze(0)
         if AUDIO_POWER_NORMALIZE:
             waveform = read_audio(wav_path)
             waveform = _power_normalize(waveform)
@@ -269,8 +315,8 @@ class SpeakerDiarizer:
     ) -> np.ndarray:
         """VAD セグメント群の埋め込みを一括計算する。
 
-        長さの近いセグメントをまとめてパディング → Inference.infer で
-        バッチ forward pass を実行し、N 回→ ceil(N/batch) 回に削減する。
+        長さの近いセグメントをまとめてパディング → バッチ forward pass を実行し、
+        N 回→ ceil(N/batch) 回に削減する。
 
         Returns:
             (N, embed_dim) の numpy 配列
@@ -291,17 +337,38 @@ class SpeakerDiarizer:
 
         all_embeds: list[np.ndarray] = [None] * n  # type: ignore[list-item]
         bs = self.embed_batch_size
-        for bi in range(0, n, bs):
-            idx_batch = order[bi : bi + bs]
-            max_len = max(lengths[i] for i in idx_batch)
-            batch_tensor = torch.zeros(len(idx_batch), 1, max_len)
-            for j, idx in enumerate(idx_batch):
-                s, e = sample_ranges[idx]
-                batch_tensor[j, 0, : lengths[idx]] = audio_tensor[s:e]
-            embeds = self.inference.infer(batch_tensor)
-            for j, idx in enumerate(idx_batch):
-                all_embeds[idx] = embeds[j]
-            del batch_tensor
+
+        if self._use_custom_model:
+            for bi in range(0, n, bs):
+                idx_batch = order[bi : bi + bs]
+                max_len = max(lengths[i] for i in idx_batch)
+                batch_tensor = torch.zeros(len(idx_batch), max_len)
+                attn_mask = torch.zeros(len(idx_batch), max_len, dtype=torch.long)
+                for j, idx in enumerate(idx_batch):
+                    s, e = sample_ranges[idx]
+                    seg_len = lengths[idx]
+                    batch_tensor[j, :seg_len] = audio_tensor[s:e]
+                    attn_mask[j, :seg_len] = 1
+                batch_tensor = batch_tensor.to(self.device)
+                attn_mask = attn_mask.to(self.device)
+                with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
+                    emb = self._custom_model.extract_embedding(batch_tensor, attention_mask=attn_mask)
+                emb_np = emb.float().cpu().numpy()
+                for j, idx in enumerate(idx_batch):
+                    all_embeds[idx] = emb_np[j]
+                del batch_tensor, attn_mask, emb
+        else:
+            for bi in range(0, n, bs):
+                idx_batch = order[bi : bi + bs]
+                max_len = max(lengths[i] for i in idx_batch)
+                batch_tensor = torch.zeros(len(idx_batch), 1, max_len)
+                for j, idx in enumerate(idx_batch):
+                    s, e = sample_ranges[idx]
+                    batch_tensor[j, 0, : lengths[idx]] = audio_tensor[s:e]
+                embeds = self.inference.infer(batch_tensor)
+                for j, idx in enumerate(idx_batch):
+                    all_embeds[idx] = embeds[j]
+                del batch_tensor
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
